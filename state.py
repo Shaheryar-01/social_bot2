@@ -10,6 +10,56 @@ authenticated_users = {}  # sender_id -> {cnic, name, verification_stage}
 user_sessions = {} 
 processed_messages = set()
 
+user_languages = {}  # sender_id -> language_code for each message
+user_last_languages = {}  # sender_id -> last_detected_language (for number-only messages)
+
+def set_user_language(sender_id: str, language: str):
+    """Set the current language for user's message."""
+    user_languages[sender_id] = language
+    # Also store as last language for future reference
+    user_last_languages[sender_id] = language
+    logger.info(f"Set language for user {sender_id}: {language}")
+
+def get_user_language(sender_id: str) -> str:
+    """Get the current language for user."""
+    return user_languages.get(sender_id, 'en')
+
+def get_user_last_language(sender_id: str) -> str:
+    """Get the last detected language for user (useful for number-only messages)."""
+    return user_last_languages.get(sender_id, 'en')
+
+def clear_user_language(sender_id: str):
+    """Clear language data for user."""
+    if sender_id in user_languages:
+        del user_languages[sender_id]
+    if sender_id in user_last_languages:
+        del user_last_languages[sender_id]
+
+# Update cleanup function
+def cleanup_old_user_languages():
+    """Clean up old user language data."""
+    active_users = set(authenticated_users.keys()) | set(pending_transfers.keys())
+    languages_to_remove = []
+    last_languages_to_remove = []
+    
+    for sender_id in user_languages.keys():
+        if sender_id not in active_users:
+            languages_to_remove.append(sender_id)
+    
+    for sender_id in user_last_languages.keys():
+        if sender_id not in active_users:
+            last_languages_to_remove.append(sender_id)
+    
+    for sender_id in languages_to_remove:
+        del user_languages[sender_id]
+    
+    for sender_id in last_languages_to_remove:
+        del user_last_languages[sender_id]
+    
+    if languages_to_remove or last_languages_to_remove:
+        logger.info(f"Cleaned up language data for {len(languages_to_remove)} users")
+
+
 # Enhanced CNIC-based authentication stages with OTP
 VERIFICATION_STAGES = {
     "NOT_VERIFIED": "not_verified",

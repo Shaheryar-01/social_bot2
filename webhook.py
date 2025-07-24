@@ -6,6 +6,7 @@ import os
 import requests
 import re
 from typing import Dict, Any, Tuple
+from translation_service import translation_service
 from state import (
     authenticated_users, processed_messages, periodic_cleanup,
     VERIFICATION_STAGES, TRANSFER_STATES, pending_transfers,
@@ -13,7 +14,7 @@ from state import (
     is_fully_authenticated, get_user_account_info, clear_user_state,
     is_valid_otp, set_pending_transfer, get_pending_transfer, 
     clear_pending_transfer, is_in_transfer_flow, get_transfer_stage,
-    restart_user_session, is_banking_related_query
+    restart_user_session, is_banking_related_query, set_user_language,get_user_language, get_user_last_language
 )
 import time
 import logging
@@ -122,57 +123,83 @@ def is_restart_command(message: str) -> bool:
     message_lower = message.lower().strip()
     return any(cmd in message_lower for cmd in restart_commands)
 
+
 async def process_user_message(sender_id: str, user_message: str) -> str:
-    """Process user message with enhanced authentication flow including OTP and smart account selection."""
+    """Process user message with enhanced authentication flow including multilingual support."""
     
     current_time = time.time()
     
     # Rate limiting
     if sender_id in user_last_message_time:
         if current_time - user_last_message_time[sender_id] < 2:
-            return "I appreciate your enthusiasm! Please give me just a moment to process your previous message before sending another. 😊"
+            # Use last known language for rate limit message
+            last_lang = get_user_last_language(sender_id)
+            rate_limit_msg = "I appreciate your enthusiasm! Please give me just a moment to process your previous message before sending another. 😊"
+            return translation_service.translate_from_english(rate_limit_msg, last_lang)
     
     user_last_message_time[sender_id] = current_time
 
-    # 🚪 CHECK FOR RESTART COMMAND (equivalent to page refresh)
-    if is_restart_command(user_message):
+    # 🌍 UPDATED: Smart Language Detection with last language fallback
+    detected_language = translation_service.detect_language_smart(
+        user_message, 
+        sender_id=sender_id, 
+        get_last_language_func=get_user_last_language
+    )
+    set_user_language(sender_id, detected_language)
+    
+    logger.info({
+        "action": "language_detected",
+        "sender_id": sender_id,
+        "detected_language": detected_language,
+        "original_message": user_message,
+        "is_number_only": translation_service.is_number_only_text(user_message)
+    })
+    
+    # Translate to English for processing
+    english_message = translation_service.translate_to_english(user_message, detected_language)
+    
+    if english_message != user_message:
+        logger.info({
+            "action": "message_translated_to_english",
+            "sender_id": sender_id,
+            "original": user_message,
+            "translated": english_message
+        })
+
+    # Rest of your existing logic remains the same...
+    # Just replace user_message with english_message in all processing
+
+    # 🚪 CHECK FOR RESTART COMMAND
+    if is_restart_command(english_message):
         logger.info({
             "action": "restart_command_detected",
             "sender_id": sender_id
         })
         
-        # Clear all user state (equivalent to fresh page load)
         restart_user_session(sender_id)
-        
-        # Return to initial greeting
-        return await ai_agent.handle_initial_greeting()
+        english_response = await ai_agent.handle_initial_greeting()
+        return translation_service.translate_from_english(english_response, detected_language)
 
-    # 🚪 CHECK FOR EXIT COMMAND (before any other processing)
-    if user_message.strip().lower() == "exit":
+    # 🚪 CHECK FOR EXIT COMMAND
+    if english_message.strip().lower() == "exit":
         logger.info({
             "action": "exit_command_detected",
             "sender_id": sender_id
         })
         
-        # Get user info for personalized goodbye
         user_info = get_user_account_info(sender_id)
         first_name = user_info.get("name", "").split()[0] if user_info.get("name") else ""
         account_number = user_info.get("account_number", "")
         
-        # Clear user session completely
         clear_user_state(sender_id)
         
-        logger.info({
-            "action": "session_terminated",
-            "sender_id": sender_id
-        })
-        
-        # Use AI agent for natural session end response
-        return await ai_agent.handle_session_end(account_number, first_name)
+        english_response = await ai_agent.handle_session_end(account_number, first_name)
+        return translation_service.translate_from_english(english_response, detected_language)
 
     # Check if user is in transfer confirmation flow
     if is_in_transfer_flow(sender_id):
-        return await handle_transfer_flow(sender_id, user_message)
+        english_response = await handle_transfer_flow(sender_id, english_message)
+        return translation_service.translate_from_english(english_response, detected_language)
 
     # Get current verification stage
     verification_stage = get_user_verification_stage(sender_id)
@@ -181,25 +208,122 @@ async def process_user_message(sender_id: str, user_message: str) -> str:
         "action": "processing_user_message",
         "sender_id": sender_id,
         "verification_stage": verification_stage,
-        "user_message": user_message
+        "original_message": user_message,
+        "english_message": english_message,
+        "detected_language": detected_language
     })
 
-    # Handle different verification stages
+    # Handle different verification stages with translated messages
+    english_response = ""
+    
     if verification_stage == VERIFICATION_STAGES["NOT_VERIFIED"]:
-        return await handle_cnic_verification(sender_id, user_message)
+        english_response = await handle_cnic_verification(sender_id, english_message)
     
     elif verification_stage == VERIFICATION_STAGES["CNIC_VERIFIED"]:
-        return await handle_otp_verification(sender_id, user_message)
+        english_response = await handle_otp_verification(sender_id, english_message)
     
     elif verification_stage == VERIFICATION_STAGES["OTP_REQUIRED"]:
-        return await handle_account_selection(sender_id, user_message)
+        english_response = await handle_account_selection(sender_id, english_message)
     
     elif verification_stage == VERIFICATION_STAGES["ACCOUNT_SELECTED"]:
-        return await handle_banking_queries(sender_id, user_message)
+        english_response = await handle_banking_queries(sender_id, english_message)
     
     else:
-        # Fallback to AI agent session start
-        return await ai_agent.handle_initial_greeting()
+        english_response = await ai_agent.handle_initial_greeting()
+
+    # 🌍 Translate response back to user's language
+    final_response = translation_service.translate_from_english(english_response, detected_language)
+    
+    if final_response != english_response:
+        logger.info({
+            "action": "response_translated_back",
+            "sender_id": sender_id,
+            "english_response": english_response[:100] + "..." if len(english_response) > 100 else english_response,
+            "translated_response": final_response[:100] + "..." if len(final_response) > 100 else final_response,
+            "target_language": detected_language
+        })
+    
+    return final_response
+
+
+# async def process_user_message(sender_id: str, user_message: str) -> str:
+#     """Process user message with enhanced authentication flow including OTP and smart account selection."""
+    
+#     current_time = time.time()
+    
+#     # Rate limiting
+#     if sender_id in user_last_message_time:
+#         if current_time - user_last_message_time[sender_id] < 2:
+#             return "I appreciate your enthusiasm! Please give me just a moment to process your previous message before sending another. 😊"
+    
+#     user_last_message_time[sender_id] = current_time
+
+#     # 🚪 CHECK FOR RESTART COMMAND (equivalent to page refresh)
+#     if is_restart_command(user_message):
+#         logger.info({
+#             "action": "restart_command_detected",
+#             "sender_id": sender_id
+#         })
+        
+#         # Clear all user state (equivalent to fresh page load)
+#         restart_user_session(sender_id)
+        
+#         # Return to initial greeting
+#         return await ai_agent.handle_initial_greeting()
+
+#     # 🚪 CHECK FOR EXIT COMMAND (before any other processing)
+#     if user_message.strip().lower() == "exit":
+#         logger.info({
+#             "action": "exit_command_detected",
+#             "sender_id": sender_id
+#         })
+        
+#         # Get user info for personalized goodbye
+#         user_info = get_user_account_info(sender_id)
+#         first_name = user_info.get("name", "").split()[0] if user_info.get("name") else ""
+#         account_number = user_info.get("account_number", "")
+        
+#         # Clear user session completely
+#         clear_user_state(sender_id)
+        
+#         logger.info({
+#             "action": "session_terminated",
+#             "sender_id": sender_id
+#         })
+        
+#         # Use AI agent for natural session end response
+#         return await ai_agent.handle_session_end(account_number, first_name)
+
+#     # Check if user is in transfer confirmation flow
+#     if is_in_transfer_flow(sender_id):
+#         return await handle_transfer_flow(sender_id, user_message)
+
+#     # Get current verification stage
+#     verification_stage = get_user_verification_stage(sender_id)
+    
+#     logger.info({
+#         "action": "processing_user_message",
+#         "sender_id": sender_id,
+#         "verification_stage": verification_stage,
+#         "user_message": user_message
+#     })
+
+#     # Handle different verification stages
+#     if verification_stage == VERIFICATION_STAGES["NOT_VERIFIED"]:
+#         return await handle_cnic_verification(sender_id, user_message)
+    
+#     elif verification_stage == VERIFICATION_STAGES["CNIC_VERIFIED"]:
+#         return await handle_otp_verification(sender_id, user_message)
+    
+#     elif verification_stage == VERIFICATION_STAGES["OTP_REQUIRED"]:
+#         return await handle_account_selection(sender_id, user_message)
+    
+#     elif verification_stage == VERIFICATION_STAGES["ACCOUNT_SELECTED"]:
+#         return await handle_banking_queries(sender_id, user_message)
+    
+#     else:
+#         # Fallback to AI agent session start
+#         return await ai_agent.handle_initial_greeting()
 
 async def handle_cnic_verification(sender_id: str, user_message: str) -> str:
     """Handle CNIC verification step with proper greeting detection."""
